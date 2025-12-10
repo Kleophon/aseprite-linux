@@ -1,50 +1,246 @@
-name: aseprite-linux
+name: aseprite-linux-build
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to build, leave empty for latest"
+        description: 'Aseprite branch or tag to build (leave empty for main)'
         required: false
+        default: ''
+      backend:
+        description: 'Which backend to build: skia or sdl2'
+        required: false
+        default: 'skia'
+      produce_appimage:
+        description: 'Produce AppImage (true/false)'
+        required: false
+        default: 'true'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 720
+
+    env:
+      ASEPRITE_DIR: ${{ github.workspace }}/aseprite
+      BUILD_DIR: ${{ github.workspace }}/aseprite/build
+      CCACHE_DIR: ${{ runner.temp }}/ccache
 
     steps:
-      - name: Checkout
+      - name: Checkout workflow repo (for artifact metadata)
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.version || 'main' }}
 
-      - name: Install dependencies
+      - name: Resolve inputs
+        id: inputs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            g++ clang cmake ninja-build git python3 \
+          version="${{ github.event.inputs.version }}"
+          if [ -z "$version" ]; then version="main"; fi
+          echo "version=$version" >> $GITHUB_OUTPUT
+          backend="${{ github.event.inputs.backend }}"
+          if [ -z "$backend" ]; then backend="skia"; fi
+          echo "backend=$backend" >> $GITHUB_OUTPUT
+          produce_appimage="${{ github.event.inputs.produce_appimage }}"
+          echo "produce_appimage=$produce_appimage" >> $GITHUB_OUTPUT
+
+      - name: Cache apt packages (speeds up installs)
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-cache-${{ runner.os }}-v1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git python3 pkg-config curl unzip wget \
+            g++ clang \
             libsdl2-dev libpng-dev zlib1g-dev libfreetype6-dev \
             libfontconfig1-dev libx11-dev libxcursor-dev libxi-dev \
-            libgl1-mesa-dev libxext-dev libxrender-dev
+            libgl1-mesa-dev libxext-dev libxrender-dev libxrandr-dev libxinerama-dev libxxf86vm-dev \
+            libasound2-dev libpulse-dev ca-certificates \
+            libjpeg-dev libgif-dev libtiff-dev
 
-      - name: Configure Aseprite
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt') }}-v1
+
+      - name: Setup ccache
         run: |
-          mkdir build
-          cd build
-          cmake \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLAF_BACKEND=SDL2 \
-            -G Ninja \
-            ..
+          mkdir -p "${{ env.CCACHE_DIR }}"
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          sudo apt-get install -y ccache || true
+          echo "CCACHE_DIR=${CCACHE_DIR}" >> $GITHUB_ENV
 
-      - name: Build Aseprite
+      - name: Checkout upstream Aseprite
         run: |
-          cd build
-          ninja
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ steps.inputs.outputs.version }}" https://github.com/aseprite/aseprite.git "${ASEPRITE_DIR}" || \
+            { echo "Failed to clone specified ref; cloning main"; git clone --depth 1 https://github.com/aseprite/aseprite.git "${ASEPRITE_DIR}"; }
+          cd "${ASEPRITE_DIR}"
+          git submodule update --init --recursive || true
+        env:
+          ASEPRITE_DIR: ${{ env.ASEPRITE_DIR }}
 
-      - name: Upload Artifact
+      - name: Restore/sketch caches for Skia (depot_tools & skia) (only used if backend=skia)
+        if: steps.inputs.outputs.backend == 'skia'
+        uses: actions/cache@v4
+        with:
+          path: |
+            $HOME/.depot_tools
+            ${{ github.workspace }}/skia/out
+          key: skia-cache-${{ runner.os }}-${{ steps.inputs.outputs.version }}-v1
+
+      - name: Fetch and build Skia (heavy) - only if backend=skia
+        if: steps.inputs.outputs.backend == 'skia'
+        run: |
+          set -euo pipefail
+          export DEPS_DIR="${{ github.workspace }}/skia"
+          mkdir -p "${DEPS_DIR}"
+          cd "${DEPS_DIR}"
+          # depot_tools (required by Skia)
+          if [ ! -d "$HOME/.depot_tools" ]; then
+            git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/.depot_tools"
+          fi
+          export PATH="$HOME/.depot_tools:$PATH"
+          # Clone skia shallowly
+          if [ ! -d "${DEPS_DIR}/skia" ]; then
+            git clone --depth 1 https://skia.googlesource.com/skia.git "${DEPS_DIR}/skia"
+          fi
+          cd "${DEPS_DIR}/skia"
+          # Try to sync deps (may skip some heavy pieces); tolerate failures
+          if command -v python3 >/dev/null 2>&1; then
+            # Attempt to run sync script if present
+            if [ -f "tools/git-sync-deps" ]; then
+              python3 tools/git-sync-deps || true
+            fi
+          fi
+          # Generate static build (disable GPU for CI to reduce complexity)
+          OUT_DIR="out/Release"
+          python3 tools/gn gen "${OUT_DIR}" --args="is_official_build=true skia_use_system_freetype2=true skia_use_system_libpng=true skia_use_system_zlib=true skia_enable_gpu=false"
+          ninja -C "${OUT_DIR}" -j$(nproc) || ( echo "Skia build failed"; exit 1 )
+          # Record SKIA_DIR for cmake
+          echo "SKIA_DIR=${DEPS_DIR}/skia" >> $GITHUB_OUTPUT
+        env:
+          DEPS_DIR: ${{ github.workspace }}/skia
+
+      - name: Cache aseprite build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${GITHUB_WORKSPACE}/aseprite/build
+          key: aseprite-build-${{ runner.os }}-${{ steps.inputs.outputs.version }}-${{ steps.inputs.outputs.backend }}-v1
+
+      - name: Configure Aseprite (CMake)
+        working-directory: ${{ env.ASEPRITE_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cd build
+          export CC="clang" || true
+          export CXX="clang++" || true
+          cmake_args="-DCMAKE_BUILD_TYPE=Release -G Ninja -DCMAKE_INSTALL_PREFIX=${PWD}/install"
+          if [ "${{ steps.inputs.outputs.backend }}" = "sdl2" ]; then
+            cmake $cmake_args -DLAF_BACKEND=SDL2 ..
+          else
+            # Using Skia backend
+            SKIA_DIR="${{ steps.inputs.outputs.SKIA_DIR }}"
+            if [ -z "$SKIA_DIR" ]; then
+              # fallback to workspace skia
+              SKIA_DIR="${{ github.workspace }}/skia/skia"
+            fi
+            # SKIA build produced a static lib in out/Release (gn args above)
+            SKIA_LIB="${SKIA_DIR}/out/Release/libskia.a"
+            if [ ! -f "$SKIA_LIB" ]; then
+              echo "Warning: expected skia static lib not found at $SKIA_LIB; cmake may fail"
+            fi
+            cmake $cmake_args -DLAF_BACKEND=SKIA -DSKIA_DIR="$SKIA_DIR" -DSKIA_LIBRARY="$SKIA_LIB" ..
+          fi
+
+      - name: Build Aseprite (ninja)
+        working-directory: ${{ env.ASEPRITE_DIR }}/build
+        run: |
+          set -euo pipefail
+          # Prefer building the 'aseprite' target, otherwise build all
+          ninja -v aseprite || ninja -v
+
+      - name: Verify binary
+        run: |
+          set -euo pipefail
+          BIN="${{ env.ASEPRITE_DIR }}/build/bin/aseprite"
+          if [ -f "$BIN" ]; then
+            echo "Aseprite binary built at $BIN"
+            file "$BIN"
+            ls -lh "$(dirname "$BIN")"
+          else
+            echo "Build finished but aseprite binary not found."
+            ls -la "${{ env.ASEPRITE_DIR }}/build" || true
+            exit 1
+          fi
+
+      - name: Package tar.gz artifact
+        run: |
+          set -euo pipefail
+          cd "${{ env.ASEPRITE_DIR }}/build"
+          outdir="${GITHUB_WORKSPACE}/artifacts"
+          mkdir -p "${outdir}"
+          ver="${{ steps.inputs.outputs.version }}"
+          name="aseprite-linux-${ver}-${{ steps.inputs.outputs.backend }}"
+          tar -caf "${outdir}/${name}.tar.gz" -C bin .
+          echo "Created ${outdir}/${name}.tar.gz"
+        env:
+          ASEPRITE_DIR: ${{ env.ASEPRITE_DIR }}
+
+      - name: Create AppDir and AppImage (optional)
+        if: ${{ steps.inputs.outputs.produce_appimage == 'true' }}
+        run: |
+          set -euo pipefail
+          APPDIR="${GITHUB_WORKSPACE}/AppDir"
+          mkdir -p "${APPDIR}/usr/bin" "${APPDIR}/usr/share/applications" "${APPDIR}/usr/share/icons/hicolor/128x128/apps"
+          BIN="${{ env.ASEPRITE_DIR }}/build/bin/aseprite"
+          cp "$BIN" "${APPDIR}/usr/bin/aseprite" || { echo "Binary not found for AppImage"; exit 1; }
+          # Minimal desktop file
+          cat > "${APPDIR}/usr/share/applications/aseprite.desktop" <<'EOF'
+[Desktop Entry]
+Name=Aseprite
+Exec=aseprite
+Icon=aseprite
+Type=Application
+Categories=Graphics;
+EOF
+          # If you have an icon, copy it. We'll create a placeholder PNG
+          if [ -f "${{ env.ASEPRITE_DIR }}/resources/icons/aseprite.png" ]; then
+            cp "${{ env.ASEPRITE_DIR }}/resources/icons/aseprite.png" "${APPDIR}/usr/share/icons/hicolor/128x128/apps/aseprite.png"
+          else
+            # create placeholder icon (32x32) using convert if available (optional)
+            if command -v convert >/dev/null 2>&1; then
+              convert -size 128x128 xc:transparent -fill '#ff6600' -draw "circle 64,64 64,10" "${APPDIR}/usr/share/icons/hicolor/128x128/apps/aseprite.png" || true
+            fi
+          fi
+          # Add AppRun launcher
+          cat > "${APPDIR}/AppRun" <<'EOF'
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "$0")")"
+export LD_LIBRARY_PATH="$HERE/usr/lib:${LD_LIBRARY_PATH:-}"
+exec "$HERE/usr/bin/aseprite" "$@"
+EOF
+          chmod +x "${APPDIR}/AppRun"
+          # Download appimagetool and build AppImage
+          cd "${GITHUB_WORKSPACE}"
+          APPIMAGETOOL="appimagetool-x86_64.AppImage"
+          if [ ! -f "${APPIMAGETOOL}" ]; then
+            curl -Lo "${APPIMAGETOOL}" "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+            chmod +x "${APPIMAGETOOL}"
+          fi
+          ./appimagetool-x86_64.AppImage "${APPDIR}" || { echo "appimagetool failed"; exit 1; }
+          echo "AppImage(s) are in ${GITHUB_WORKSPACE}"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: aseprite-linux-${{ github.event.inputs.version || 'latest' }}
-          path: build/bin
+          name: aseprite-build-${{ steps.inputs.outputs.version }}-${{ steps.inputs.outputs.backend }}
+          path: |
+            artifacts/*.tar.gz
+            *.AppImage
           if-no-files-found: error
