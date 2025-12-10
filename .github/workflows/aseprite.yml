@@ -1,0 +1,56 @@
+name: aseprite-linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, leave empty for latest"
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build g++ git libx11-dev libxcursor-dev \
+            libxi-dev libgl1-mesa-dev libxext-dev libxrender-dev \
+            libfreetype6-dev libfontconfig1-dev
+
+      - name: Clone Skia
+        run: |
+          git clone https://github.com/aseprite/skia.git skia
+          cd skia
+          python3 tools/git-sync-deps       # needed for Skia deps
+          ./tools/build-linux.sh
+
+      - name: Configure Aseprite
+        run: |
+          mkdir build
+          cd build
+          cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR=../skia \
+            -DSKIA_LIBRARY_DIR=../skia/out/Release-x64 \
+            -G Ninja \
+            ..
+
+      - name: Build Aseprite
+        run: |
+          cd build
+          ninja
+
+      - name: Archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: aseprite-linux-${{ github.event.inputs.version || 'latest' }}
+          path: build/bin
+          if-no-files-found: error
+
