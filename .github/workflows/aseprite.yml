@@ -19,16 +19,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake ninja-build g++ git libx11-dev libxcursor-dev \
-            libxi-dev libgl1-mesa-dev libxext-dev libxrender-dev \
-            libfreetype6-dev libfontconfig1-dev
+            g++ clang ninja-build cmake git python3 curl \
+            libx11-dev libxcursor-dev libxi-dev libgl1-mesa-dev \
+            libxext-dev libxrender-dev libfreetype6-dev libfontconfig1-dev
 
-      - name: Clone Skia
+      - name: Get Skia
         run: |
           git clone https://github.com/aseprite/skia.git skia
           cd skia
-          python3 tools/git-sync-deps       # needed for Skia deps
-          ./tools/build-linux.sh
+          python3 tools/git-sync-deps
+
+      - name: Build Skia
+        run: |
+          cd skia
+          bin/gn gen out/Release --args='
+            is_official_build=true
+            is_debug=false
+            is_component_build=false
+            skia_use_system_expat=false
+            skia_use_system_freetype2=false
+            skia_use_system_libpng=false
+            skia_use_system_libjpeg_turbo=false
+            skia_use_system_zlib=false
+            skia_use_system_harfbuzz=false
+          '
+          ninja -C out/Release skia
 
       - name: Configure Aseprite
         run: |
@@ -38,7 +53,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DLAF_BACKEND=skia \
             -DSKIA_DIR=../skia \
-            -DSKIA_LIBRARY_DIR=../skia/out/Release-x64 \
+            -DSKIA_LIBRARY_DIR=../skia/out/Release \
             -G Ninja \
             ..
 
@@ -53,4 +68,3 @@ jobs:
           name: aseprite-linux-${{ github.event.inputs.version || 'latest' }}
           path: build/bin
           if-no-files-found: error
-
