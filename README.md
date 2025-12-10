@@ -7,3 +7,5 @@ Instructions are same:
 5. Scroll to the bottom to download .zip archive
 
 For building newer aseprite version repeat steps 3 to 5.
+
+Upd:Thanks for amazing [workflow](https://github.com/a1393323447)
