@@ -8,4 +8,13 @@ Instructions are same:
 
 For building newer aseprite version repeat steps 3 to 5.
 
-Upd:Thanks for amazing [workflow](https://github.com/a1393323447)
+Upd:
+According to Eula:
+
+    (b) Distribution.
+
+    You may not distribute copies of the SOFTWARE PRODUCT to third parties. Evaluation versions available for download from the Licensor's websites may be freely distributed.
+
+we need to remove the product in Releases .
+
+Also, Thanks for amazing [workflow](https://github.com/a1393323447)
