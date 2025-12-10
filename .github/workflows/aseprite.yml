@@ -1,4 +1,4 @@
-name: aseprite-linux-build
+name: aseprite-linux
 
 on:
   workflow_dispatch:
